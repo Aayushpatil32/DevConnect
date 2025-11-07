@@ -4,66 +4,53 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const axios = require('axios');
 require('dotenv').config();
 
 const app = express();
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  credentials: true
+}));
 app.use(express.json());
 
-// Enhanced MongoDB Connection with better error handling
+// Debug middleware
+app.use((req, res, next) => {
+  console.log(`📍 ${new Date().toISOString()} - ${req.method} ${req.originalUrl}`);
+  next();
+});
+
+// MongoDB Connection
 const connectDB = async () => {
   try {
     const mongoUri = process.env.MONGODB_URI || process.env.MONGO_URI || 'mongodb://localhost:27017/devconnect';
     
     if (!mongoUri) {
       console.error('❌ MongoDB URI not found in environment variables');
-      console.log('💡 Please add MONGODB_URI to your .env file');
       return;
     }
 
     console.log('🔗 Attempting to connect to MongoDB...');
     
     const conn = await mongoose.connect(mongoUri, {
-      serverSelectionTimeoutMS: 10000, // Increased to 10 seconds
+      serverSelectionTimeoutMS: 10000,
       socketTimeoutMS: 45000,
-      maxPoolSize: 10, // Maximum number of connections in the pool
+      maxPoolSize: 10,
     });
     
     console.log('✅ MongoDB Connected Successfully');
-    console.log(`📊 Database: ${conn.connection.db.databaseName}`);
-    console.log(`🏠 Host: ${conn.connection.host}`);
-    
-    // Connection event handlers
-    mongoose.connection.on('connected', () => {
-      console.log('📡 Mongoose connected to DB');
-    });
-    
-    mongoose.connection.on('error', (err) => {
-      console.error('❌ Mongoose connection error:', err);
-    });
-    
-    mongoose.connection.on('disconnected', () => {
-      console.log('⚠️  Mongoose disconnected from DB');
-    });
     
   } catch (error) {
     console.error('❌ MongoDB Connection Failed:', error.message);
-    console.log('💡 Troubleshooting tips:');
-    console.log('   1. Check your MONGODB_URI in .env file');
-    console.log('   2. Verify MongoDB Atlas credentials');
-    console.log('   3. Ensure IP is whitelisted in MongoDB Atlas');
-    console.log('   4. Check your internet connection');
-    
-    // Graceful shutdown in production
     if (process.env.NODE_ENV === 'production') {
       process.exit(1);
     }
   }
 };
 
-// Connect to database
 connectDB();
 
 // User Schema
@@ -107,12 +94,16 @@ const userSchema = new mongoose.Schema({
   createdAt: { 
     type: Date, 
     default: Date.now 
+  },
+  oauth: {
+    google: { type: String, sparse: true },
+    github: { type: String, sparse: true },
+    linkedin: { type: String, sparse: true }
   }
 }, {
   timestamps: true
 });
 
-// Add index for better query performance
 userSchema.index({ username: 1 });
 userSchema.index({ email: 1 });
 
@@ -140,7 +131,7 @@ const postSchema = new mongoose.Schema({
   message: { 
     type: String, 
     required: [true, 'Message is required'], 
-    maxlength: [500, 'Message cannot exceed 500 characters'],
+    maxlength: [5000, 'Message cannot exceed 1000 characters'],
     trim: true
   },
   likes: { 
@@ -163,14 +154,13 @@ const postSchema = new mongoose.Schema({
   timestamps: true
 });
 
-// Add indexes for better performance
 postSchema.index({ userId: 1, createdAt: -1 });
 postSchema.index({ createdAt: -1 });
 postSchema.index({ likes: -1 });
 
 const Post = mongoose.model('Post', postSchema);
 
-// Enhanced Auth Middleware
+// Auth Middleware
 const authMiddleware = async (req, res, next) => {
   try {
     const token = req.headers.authorization?.split(' ')[1];
@@ -205,14 +195,17 @@ const authMiddleware = async (req, res, next) => {
   }
 };
 
-// ============ ENHANCED AUTH ROUTES ============
+// OAuth State Management
+const oauthStates = new Map();
+const generateState = () => crypto.randomBytes(16).toString('hex');
+
+// ============ AUTH ROUTES ============
 
 // Register
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { username, email, password, name } = req.body;
     
-    // Validation
     if (!username || !email || !password || !name) {
       return res.status(400).json({ 
         success: false,
@@ -220,7 +213,6 @@ app.post('/api/auth/register', async (req, res) => {
       });
     }
 
-    // Check if user exists
     const existingUser = await User.findOne({ 
       $or: [{ email: email.toLowerCase() }, { username }] 
     });
@@ -232,10 +224,8 @@ app.post('/api/auth/register', async (req, res) => {
       });
     }
     
-    // Hash password
     const hashedPassword = await bcrypt.hash(password, 12);
     
-    // Create user
     const user = new User({
       username: username.trim(),
       email: email.toLowerCase().trim(),
@@ -246,7 +236,6 @@ app.post('/api/auth/register', async (req, res) => {
     
     await user.save();
     
-    // Generate token
     const token = jwt.sign(
       { userId: user._id },
       process.env.JWT_SECRET || 'your-fallback-secret-key-for-development-only',
@@ -297,7 +286,6 @@ app.post('/api/auth/login', async (req, res) => {
       });
     }
     
-    // Find user by username or email
     const user = await User.findOne({
       $or: [
         { username: username.trim() },
@@ -312,7 +300,6 @@ app.post('/api/auth/login', async (req, res) => {
       });
     }
     
-    // Check password
     const isValidPassword = await bcrypt.compare(password, user.password);
     if (!isValidPassword) {
       return res.status(401).json({ 
@@ -321,7 +308,6 @@ app.post('/api/auth/login', async (req, res) => {
       });
     }
     
-    // Generate token
     const token = jwt.sign(
       { userId: user._id },
       process.env.JWT_SECRET || 'your-fallback-secret-key-for-development-only',
@@ -351,34 +337,285 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// Get Current User
-app.get('/api/auth/me', authMiddleware, async (req, res) => {
+// ============ GOOGLE OAUTH ROUTES ============
+
+app.get('/api/auth/google', (req, res) => {
+  const state = generateState();
+  oauthStates.set(state, { provider: 'google', timestamp: Date.now() });
+  
+  const redirectUri = `${process.env.BACKEND_URL || 'http://localhost:5000'}/api/auth/google/callback`;
+  
+  const authUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+  authUrl.searchParams.set('client_id', process.env.GOOGLE_CLIENT_ID);
+  authUrl.searchParams.set('redirect_uri', redirectUri);
+  authUrl.searchParams.set('response_type', 'code');
+  authUrl.searchParams.set('scope', 'profile email');
+  authUrl.searchParams.set('state', state);
+  authUrl.searchParams.set('access_type', 'offline');
+  authUrl.searchParams.set('prompt', 'consent');
+  
+  res.json({ success: true, url: authUrl.toString() });
+});
+
+app.get('/api/auth/google/callback', async (req, res) => {
   try {
-    const user = await User.findById(req.userId).select('-password');
+    const { code, state } = req.query;
     
-    if (!user) {
-      return res.status(404).json({ 
-        success: false,
-        error: 'User not found' 
-      });
+    if (!oauthStates.has(state)) {
+      return res.redirect(`${process.env.FRONTEND_URL}?error=invalid_state`);
     }
     
-    res.json({ 
-      success: true,
-      user 
+    oauthStates.delete(state);
+    
+    const redirectUri = `${process.env.BACKEND_URL || 'http://localhost:5000'}/api/auth/google/callback`;
+    
+    const tokenResponse = await axios.post('https://oauth2.googleapis.com/token', {
+      client_id: process.env.GOOGLE_CLIENT_ID,
+      client_secret: process.env.GOOGLE_CLIENT_SECRET,
+      code,
+      redirect_uri: redirectUri,
+      grant_type: 'authorization_code'
     });
+    
+    const { access_token } = tokenResponse.data;
+    
+    const userResponse = await axios.get('https://www.googleapis.com/oauth2/v2/userinfo', {
+      headers: { Authorization: `Bearer ${access_token}` }
+    });
+    
+    const { id, email, name, picture } = userResponse.data;
+    
+    let user = await User.findOne({ 
+      $or: [
+        { email: email.toLowerCase() },
+        { 'oauth.google': id }
+      ]
+    });
+    
+    if (!user) {
+      const username = email.split('@')[0] + '_' + Math.random().toString(36).substr(2, 5);
+      
+      user = new User({
+        username,
+        email: email.toLowerCase(),
+        password: await bcrypt.hash(crypto.randomBytes(16).toString('hex'), 12),
+        name,
+        avatar: picture,
+        oauth: { google: id }
+      });
+      
+      await user.save();
+    } else if (!user.oauth?.google) {
+      user.oauth = { ...user.oauth, google: id };
+      if (!user.avatar) user.avatar = picture;
+      await user.save();
+    }
+    
+    const token = jwt.sign(
+      { userId: user._id },
+      process.env.JWT_SECRET,
+      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+    );
+    
+    res.redirect(`${process.env.FRONTEND_URL}?token=${token}&user=${encodeURIComponent(JSON.stringify({
+      id: user._id,
+      username: user.username,
+      email: user.email,
+      name: user.name,
+      avatar: user.avatar
+    }))}`);
+    
   } catch (error) {
-    console.error('Get current user error:', error);
+    console.error('Google OAuth error:', error);
+    res.redirect(`${process.env.FRONTEND_URL}?error=oauth_failed`);
+  }
+});
+
+// ============ GITHUB OAUTH ROUTES ============
+
+app.get('/api/auth/github', (req, res) => {
+  try {
+    const state = generateState();
+    oauthStates.set(state, { provider: 'github', timestamp: Date.now() });
+    
+    const redirectUri = `${process.env.BACKEND_URL || 'http://localhost:5000'}/api/auth/github/callback`;
+    
+    const authUrl = new URL('https://github.com/login/oauth/authorize');
+    authUrl.searchParams.set('client_id', process.env.GITHUB_CLIENT_ID);
+    authUrl.searchParams.set('redirect_uri', redirectUri);
+    authUrl.searchParams.set('scope', 'user:email');
+    authUrl.searchParams.set('state', state);
+    
+    console.log('🚀 GitHub OAuth URL:', authUrl.toString());
+    
+    res.json({ success: true, url: authUrl.toString() });
+  } catch (error) {
+    console.error('❌ GitHub OAuth initiation error:', error);
     res.status(500).json({ 
-      success: false,
-      error: 'Internal server error' 
+      success: false, 
+      error: 'Failed to initiate GitHub OAuth' 
     });
   }
 });
 
-// ============ ENHANCED POST ROUTES ============
+app.get('/api/auth/github/callback', async (req, res) => {
+  try {
+    const { code, state } = req.query;
+    
+    console.log('🔄 GitHub callback received:', { code: code ? 'Present' : 'Missing', state });
+    
+    if (!code) {
+      console.error('❌ No code in GitHub callback');
+      return res.redirect(`${process.env.FRONTEND_URL}?error=no_code&message=GitHub did not return authorization code`);
+    }
+    
+    if (!oauthStates.has(state)) {
+      console.error('❌ Invalid state in GitHub callback');
+      return res.redirect(`${process.env.FRONTEND_URL}?error=invalid_state&message=Invalid OAuth state`);
+    }
+    
+    oauthStates.delete(state);
+    
+    // Exchange code for access token
+    console.log('🔑 Exchanging code for access token...');
+    const tokenResponse = await axios.post(
+      'https://github.com/login/oauth/access_token',
+      {
+        client_id: process.env.GITHUB_CLIENT_ID,
+        client_secret: process.env.GITHUB_CLIENT_SECRET,
+        code,
+        redirect_uri: `${process.env.BACKEND_URL || 'http://localhost:5000'}/api/auth/github/callback`
+      },
+      {
+        headers: {
+          Accept: 'application/json'
+        }
+      }
+    );
+    
+    const { access_token } = tokenResponse.data;
+    
+    if (!access_token) {
+      console.error('❌ No access token received from GitHub');
+      return res.redirect(`${process.env.FRONTEND_URL}?error=no_token&message=Failed to get access token from GitHub`);
+    }
+    
+    console.log('✅ Access token received');
+    
+    // Get user info from GitHub
+    console.log('👤 Fetching user info from GitHub...');
+    const userResponse = await axios.get('https://api.github.com/user', {
+      headers: {
+        Authorization: `Bearer ${access_token}`,
+        Accept: 'application/json'
+      }
+    });
+    
+    const githubUser = userResponse.data;
+    console.log('✅ GitHub user info received:', githubUser.login);
+    
+    // Get user email if not public
+    let email = githubUser.email;
+    if (!email) {
+      console.log('📧 Fetching user email...');
+      const emailResponse = await axios.get('https://api.github.com/user/emails', {
+        headers: {
+          Authorization: `Bearer ${access_token}`,
+          Accept: 'application/json'
+        }
+      });
+      
+      const primaryEmail = emailResponse.data.find(e => e.primary);
+      email = primaryEmail ? primaryEmail.email : emailResponse.data[0]?.email;
+    }
+    
+    if (!email) {
+      console.error('❌ No email found for GitHub user');
+      return res.redirect(`${process.env.FRONTEND_URL}?error=no_email&message=No email associated with GitHub account`);
+    }
+    
+    console.log('✅ Email retrieved:', email);
+    
+    // Find or create user
+    let user = await User.findOne({ 
+      $or: [
+        { email: email.toLowerCase() },
+        { 'oauth.github': githubUser.id.toString() }
+      ]
+    });
+    
+    if (!user) {
+      console.log('👤 Creating new user...');
+      const username = githubUser.login + '_' + Math.random().toString(36).substr(2, 5);
+      
+      user = new User({
+        username,
+        email: email.toLowerCase(),
+        password: await bcrypt.hash(crypto.randomBytes(16).toString('hex'), 12),
+        name: githubUser.name || githubUser.login,
+        avatar: githubUser.avatar_url,
+        bio: githubUser.bio || '',
+        oauth: { github: githubUser.id.toString() }
+      });
+      
+      await user.save();
+      console.log('✅ New user created:', user.username);
+    } else if (!user.oauth?.github) {
+      console.log('🔗 Linking GitHub account to existing user...');
+      user.oauth = { ...user.oauth, github: githubUser.id.toString() };
+      if (!user.avatar) user.avatar = githubUser.avatar_url;
+      if (!user.bio && githubUser.bio) user.bio = githubUser.bio;
+      await user.save();
+      console.log('✅ GitHub account linked');
+    } else {
+      console.log('✅ Existing user found:', user.username);
+    }
+    
+    // Generate JWT
+    const token = jwt.sign(
+      { userId: user._id },
+      process.env.JWT_SECRET || 'your-fallback-secret-key-for-development-only',
+      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+    );
+    
+    console.log('✅ JWT generated, redirecting to frontend...');
+    
+    // Redirect to frontend with token
+    res.redirect(`${process.env.FRONTEND_URL}?token=${token}&user=${encodeURIComponent(JSON.stringify({
+      id: user._id,
+      username: user.username,
+      email: user.email,
+      name: user.name,
+      avatar: user.avatar
+    }))}&source=github`);
+    
+  } catch (error) {
+    console.error('❌ GitHub OAuth error:', error.response?.data || error.message);
+    res.redirect(`${process.env.FRONTEND_URL}?error=oauth_failed&message=${encodeURIComponent(error.message)}`);
+  }
+});
 
-// Get all posts with pagination
+// LinkedIn OAuth (Placeholder)
+app.get('/api/auth/linkedin', (req, res) => {
+  res.status(501).json({ 
+    success: false, 
+    error: 'LinkedIn OAuth not yet implemented. Please use Google or GitHub.' 
+  });
+});
+
+// Clean up expired OAuth states
+setInterval(() => {
+  const now = Date.now();
+  for (const [state, data] of oauthStates.entries()) {
+    if (now - data.timestamp > 3600000) {
+      oauthStates.delete(state);
+    }
+  }
+}, 3600000);
+
+// ============ POST ROUTES ============
+
+// Get all posts
 app.get('/api/posts', async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
@@ -424,14 +661,12 @@ app.post('/api/posts', authMiddleware, async (req, res) => {
         error: 'Post message is required' 
       });
     }
-    
-    if (message.trim().length > 500) {
+    if (message.trim().length > 5000) {  // CHANGED
       return res.status(400).json({ 
         success: false,
-        error: 'Post message cannot exceed 500 characters' 
+        error: 'Post message cannot exceed 5000 characters'  // CHANGED
       });
     }
-    
     const user = await User.findById(req.userId);
     if (!user) {
       return res.status(404).json({ 
@@ -450,7 +685,6 @@ app.post('/api/posts', authMiddleware, async (req, res) => {
     
     await post.save();
     
-    // Populate the post with user data
     await post.populate('userId', 'name username avatar');
     
     res.status(201).json({ 
@@ -565,11 +799,9 @@ app.post('/api/posts/:id/like', authMiddleware, async (req, res) => {
     const hasLiked = post.likedBy.some(id => id.equals(userIdObj));
     
     if (hasLiked) {
-      // Unlike
       post.likedBy = post.likedBy.filter(id => !id.equals(userIdObj));
       post.likes = Math.max(0, post.likes - 1);
     } else {
-      // Like
       post.likedBy.push(userIdObj);
       post.likes += 1;
     }
@@ -589,10 +821,73 @@ app.post('/api/posts/:id/like', authMiddleware, async (req, res) => {
   }
 });
 
-// ============ ENHANCED SEED DATA ROUTE ============
+// Get current user
+app.get('/api/auth/me', authMiddleware, async (req, res) => {
+  try {
+    const user = await User.findById(req.userId).select('-password');
+    
+    if (!user) {
+      return res.status(404).json({ 
+        success: false,
+        error: 'User not found' 
+      });
+    }
+    
+    res.json({ 
+      success: true,
+      user 
+    });
+  } catch (error) {
+    console.error('Get current user error:', error);
+    res.status(500).json({ 
+      success: false,
+      error: 'Internal server error' 
+    });
+  }
+});
+
+// Debug route
+app.get('/api/debug/oauth', (req, res) => {
+  res.json({
+    success: true,
+    routes: {
+      google: '/api/auth/google',
+      github: '/api/auth/github', 
+      linkedin: '/api/auth/linkedin'
+    },
+    env: {
+      githubClientId: process.env.GITHUB_CLIENT_ID ? 'Set' : 'Not Set',
+      googleClientId: process.env.GOOGLE_CLIENT_ID ? 'Set' : 'Not Set',
+      backendUrl: process.env.BACKEND_URL || 'Not Set',
+      frontendUrl: process.env.FRONTEND_URL || 'Not Set'
+    }
+  });
+});
+
+// Health check
+app.get('/api/health', async (req, res) => {
+  try {
+    const dbStatus = mongoose.connection.readyState === 1 ? 'connected' : 'disconnected';
+    
+    res.json({ 
+      success: true,
+      status: 'Server is running',
+      timestamp: new Date().toISOString(),
+      database: dbStatus,
+      environment: process.env.NODE_ENV || 'development'
+    });
+  } catch (error) {
+    res.status(503).json({ 
+      success: false,
+      status: 'Server error',
+      database: 'error'
+    });
+  }
+});
+
+// Seed data route
 app.post('/api/seed', async (req, res) => {
   try {
-    // Check if data already exists
     const existingUsers = await User.countDocuments();
     if (existingUsers > 0) {
       return res.status(400).json({ 
@@ -601,7 +896,6 @@ app.post('/api/seed', async (req, res) => {
       });
     }
 
-    // Create demo users
     const demoUsers = [
       {
         username: 'sarah_dev',
@@ -610,30 +904,6 @@ app.post('/api/seed', async (req, res) => {
         name: 'Sarah Chen',
         bio: 'Full-stack developer | React enthusiast | Coffee lover ☕',
         avatar: 'https://ui-avatars.com/api/?name=Sarah+Chen&background=6366f1&color=fff'
-      },
-      {
-        username: 'alex_codes',
-        email: 'alex@devconnect.com',
-        password: await bcrypt.hash('demo123', 12),
-        name: 'Alex Kumar',
-        bio: 'Backend wizard | Node.js | Docker expert 🐳',
-        avatar: 'https://ui-avatars.com/api/?name=Alex+Kumar&background=8b5cf6&color=fff'
-      },
-      {
-        username: 'emily_tech',
-        email: 'emily@devconnect.com',
-        password: await bcrypt.hash('demo123', 12),
-        name: 'Emily Rodriguez',
-        bio: 'UI/UX Developer | Design systems | Accessibility advocate',
-        avatar: 'https://ui-avatars.com/api/?name=Emily+Rodriguez&background=ec4899&color=fff'
-      },
-      {
-        username: 'david_js',
-        email: 'david@devconnect.com',
-        password: await bcrypt.hash('demo123', 12),
-        name: 'David Thompson',
-        bio: 'JavaScript ninja | TypeScript lover | Open source contributor',
-        avatar: 'https://ui-avatars.com/api/?name=David+Thompson&background=10b981&color=fff'
       },
       {
         username: 'demo',
@@ -647,7 +917,6 @@ app.post('/api/seed', async (req, res) => {
 
     const createdUsers = await User.insertMany(demoUsers);
 
-    // Create demo posts
     const demoPosts = [
       {
         userId: createdUsers[0]._id,
@@ -656,7 +925,7 @@ app.post('/api/seed', async (req, res) => {
         avatar: createdUsers[0].avatar,
         message: '🚀 Just deployed my first Next.js 14 app with server components! The performance is incredible. Anyone else exploring the app router?',
         likes: 12,
-        likedBy: [createdUsers[1]._id, createdUsers[2]._id],
+        likedBy: [createdUsers[1]._id],
         createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000)
       },
       {
@@ -668,16 +937,6 @@ app.post('/api/seed', async (req, res) => {
         likes: 8,
         likedBy: [createdUsers[0]._id],
         createdAt: new Date(Date.now() - 4 * 60 * 60 * 1000)
-      },
-      {
-        userId: createdUsers[2]._id,
-        name: createdUsers[2].name,
-        username: createdUsers[2].username,
-        avatar: createdUsers[2].avatar,
-        message: 'Working on accessibility features today. Remember: semantic HTML is your friend! <button> over <div> with onClick every time. 🎯',
-        likes: 15,
-        likedBy: [createdUsers[0]._id, createdUsers[1]._id, createdUsers[3]._id],
-        createdAt: new Date(Date.now() - 6 * 60 * 60 * 1000)
       }
     ];
 
@@ -702,35 +961,6 @@ app.post('/api/seed', async (req, res) => {
       error: 'Database seeding failed. Please try again.' 
     });
   }
-});
-
-// Enhanced Health check with DB status
-app.get('/api/health', async (req, res) => {
-  try {
-    const dbStatus = mongoose.connection.readyState === 1 ? 'connected' : 'disconnected';
-    
-    res.json({ 
-      success: true,
-      status: 'Server is running',
-      timestamp: new Date().toISOString(),
-      database: dbStatus,
-      environment: process.env.NODE_ENV || 'development'
-    });
-  } catch (error) {
-    res.status(503).json({ 
-      success: false,
-      status: 'Server error',
-      database: 'error'
-    });
-  }
-});
-
-// Graceful shutdown
-process.on('SIGINT', async () => {
-  console.log('🛑 Shutting down server gracefully...');
-  await mongoose.connection.close();
-  console.log('✅ MongoDB connection closed.');
-  process.exit(0);
 });
 
 const PORT = process.env.PORT || 5000;

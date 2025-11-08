@@ -5,7 +5,7 @@ import axios from 'axios';
 import { formatDistanceToNow } from 'date-fns';
 import { Heart, Edit2, Trash2, LogOut, Send, Loader2, Mail, Lock, User, Github, Linkedin } from 'lucide-react';
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000/api';
+const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000';
 
 export default function Home() {
   const [user, setUser] = useState(null);
@@ -125,7 +125,7 @@ export default function Home() {
         ? { username: authForm.username, password: authForm.password }
         : authForm;
 
-      const response = await axios.post(`${API_URL}${endpoint}`, payload);
+      const response = await axios.post(`${API_URL}/api${endpoint}`, payload);
       
       localStorage.setItem('token', response.data.token);
       setUser(response.data.user);

@@ -40,7 +40,6 @@ coverage/
 .nyc_output
 
 # Dependency directories
-.node_modules/
 jspm_packages/
 
 # Optional npm cache directory
@@ -118,7 +117,6 @@ coverage
 *.lcov
 
 # Dependency directories
-node_modules/
 jspm_packages/
 
 # Optional npm cache directory
@@ -180,3 +178,9 @@ temp/
 *.sln
 *.sw?node_modules/
 */node_modules/
+
+
+.vercel
+
+
+.node_modules/
